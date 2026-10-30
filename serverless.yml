@@ -1,6 +1,5 @@
 org: giancarlodavila
 service: api-web-scraping
-frameworkVersion: '3'
 
 provider:
   name: aws
@@ -11,9 +10,6 @@ provider:
   region: us-east-1
   iam:
     role: arn:aws:iam::620963888196:role/LabRole
-  environment:
-    TABLE_NAME:
-      Ref: TablaSismosIGP
 
 functions:
   scrape_table:

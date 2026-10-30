@@ -1,153 +1,169 @@
-"""Ejercicio 2: scrape de los 10 ultimos reportes sismicos del IGP y escritura en DynamoDB."""
-
+import requests
+from bs4 import BeautifulSoup
+import boto3
 import json
-import logging
-import os
 import re
 from datetime import datetime, timezone
 from decimal import Decimal
 
-import boto3
-import requests
-from bs4 import BeautifulSoup
-
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-URL_IGP = "https://ultimosismo.igp.gob.pe/productos/reportes-sismicos"
-CODIGO_RE = re.compile(r"IGP/CENSIS/RS\s+(\d{4}-\d{3,5})", re.I)
-FECHA_RE = re.compile(r"\b\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}\b")
-MAG_RE = re.compile(r"^\d{1,2}(?:[.,]\d+)?$")
-SEMAFORO_RE = re.compile(r"\b(verde|amarillo|rojo)\b", re.I)
+# Página indicada en el Ejercicio 2 del taller
+URL = 'https://ultimosismo.igp.gob.pe/productos/reportes-sismicos'
+# Fuente oficial alternativa, por si la tabla se carga con JavaScript
+URL_DATOS = ('https://ide.igp.gob.pe/arcgis/rest/services/'
+             'monitoreocensis/SismosReportados/MapServer/0/query')
+TABLA_DYNAMODB = 'sismos-igp-dev'
 
 
-def _limpiar(texto):
-    return " ".join(str(texto).split())
-
-
-def _armar_sismo(codigo, referencia, semaforo, magnitud, fecha_local):
-    """Devuelve un registro solo si sus campos esenciales son validos."""
-    if not (codigo and referencia and magnitud and fecha_local):
-        return None
-    try:
-        momento = datetime.strptime(_limpiar(fecha_local), "%d/%m/%Y %H:%M:%S")
-        valor_magnitud = float(str(magnitud).replace(",", "."))
-    except ValueError:
-        return None
-
-    clave = CODIGO_RE.search(codigo)
-    if not clave:
-        return None
+def respuesta(estado, datos):
     return {
-        "codigo": f"IGP/CENSIS/RS {clave.group(1)}",
-        "referencia": _limpiar(referencia),
-        "semaforo": semaforo.lower() if semaforo else None,
-        "magnitud": valor_magnitud,
-        "fecha_local": momento.strftime("%d/%m/%Y %H:%M:%S"),
-        "url_reporte": f"https://ultimosismo.igp.gob.pe/evento/{clave.group(1)}",
+        'statusCode': estado,
+        'headers': {'Content-Type': 'application/json; charset=utf-8'},
+        'body': json.dumps(datos, ensure_ascii=False)
     }
 
 
-def _leer_filas_de_tabla(soup):
-    """Alternativa 1: web renderizada con filas <tr> y celdas <td>."""
-    for tr in soup.select("tr"):
-        celdas = [_limpiar(c.get_text(" ", strip=True)) for c in tr.find_all(["td", "th"], recursive=False)]
-        indice = next((i for i, c in enumerate(celdas) if CODIGO_RE.search(c)), None)
-        if indice is None:
+def fecha_orden(sismo):
+    return datetime.strptime(sismo['fecha_local'], '%d/%m/%Y %H:%M:%S')
+
+
+def extraer_tabla_html(contenido):
+    # Mismo procedimiento del profesor: BeautifulSoup, tabla, filas y celdas.
+    soup = BeautifulSoup(contenido, 'html.parser')
+    table = soup.find('table')
+    if not table:
+        return []
+
+    rows = []
+    for row in table.find_all('tr'):
+        cells = [cell.get_text(' ', strip=True) for cell in row.find_all('td')]
+        # Columnas de la página: #, Cod reporte, Referencia,
+        # Semáforo, Magnitud, Fecha y hora de origen local, Ver reporte.
+        for i, celda in enumerate(cells):
+            if 'IGP/CENSIS/RS' not in celda or len(cells) < i + 5:
+                continue
+            try:
+                codigo = celda.strip()
+                referencia = cells[i + 1].strip()
+                semaforo = cells[i + 2].strip()
+                magnitud = float(cells[i + 3].replace(',', '.'))
+                fecha_local = cells[i + 4].strip()
+                datetime.strptime(fecha_local, '%d/%m/%Y %H:%M:%S')
+                rows.append({
+                    'codigo': codigo,
+                    'referencia': referencia,
+                    'semaforo': semaforo,
+                    'magnitud': magnitud,
+                    'fecha_local': fecha_local
+                })
+            except (ValueError, IndexError):
+                continue
+            break
+
+    # Evitar registros repetidos y devolver los más recientes primero.
+    rows = list({row['codigo']: row for row in rows}.values())
+    return sorted(rows, key=fecha_orden, reverse=True)[:10]
+
+
+def extraer_datos_igp():
+    # La web del IGP puede mostrar la tabla solo después de ejecutar JavaScript.
+    # En ese caso, se consultan los datos publicados por el propio IGP.
+    response = requests.get(URL_DATOS, params={
+        'where': '1=1',
+        'outFields': 'code,ref,magnitud,fecha,hora,fechaevento',
+        'orderByFields': 'fecha DESC',
+        'resultRecordCount': 50,
+        'returnGeometry': 'false',
+        'f': 'json'
+    }, timeout=12)
+    response.raise_for_status()
+    datos = response.json()
+    if 'error' in datos:
+        raise ValueError(str(datos['error']))
+
+    rows = []
+    for feature in datos.get('features', []):
+        campos = feature.get('attributes', {})
+        codigo = re.search(r'\d{4}-\d{3,5}', str(campos.get('code', '')))
+        fecha_ms = campos.get('fecha') or campos.get('fechaevento')
+        if not codigo or fecha_ms is None or campos.get('magnitud') is None:
             continue
-        codigo = celdas[indice]
-        posteriores = celdas[indice + 1:]
-        referencia = next((c for c in posteriores if c and not SEMAFORO_RE.fullmatch(c) and not MAG_RE.fullmatch(c)
-                           and not FECHA_RE.fullmatch(c) and "reporte" not in c.lower()), None)
-        semaforo = next((SEMAFORO_RE.search(c).group(1) for c in posteriores if SEMAFORO_RE.search(c)), None)
-        magnitud = next((c for c in posteriores if MAG_RE.fullmatch(c)), None)
-        fecha = next((FECHA_RE.search(c).group() for c in posteriores if FECHA_RE.search(c)), None)
-        registro = _armar_sismo(codigo, referencia, semaforo, magnitud, fecha)
-        if registro:
-            yield registro
-
-
-def _leer_fichas_de_texto(soup):
-    """Alternativa 2: fichas con etiquetas (Cod reporte, Referencia, Magnitud, etc.)."""
-    # Extraer texto visible; nunca leer scripts JSON como si fueran fichas HTML.
-    for etiqueta in soup(["script", "style", "noscript"]):
-        etiqueta.decompose()
-    texto = _limpiar(" ".join(soup.stripped_strings))
-    codigos = list(CODIGO_RE.finditer(texto))
-    patron = re.compile(
-        r"Referencia\s*:?\s*(.*?)\s*"
-        r"Sem[aá]foro\s*:?\s*(verde|amarillo|rojo)\s*"
-        r"Magnitud\s*:?\s*(\d{1,2}(?:[.,]\d+)?)\s*"
-        r"Fecha y hora de origen local\s*:?\s*(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})",
-        flags=re.I,
-    )
-    for i, codigo in enumerate(codigos):
-        fin = codigos[i + 1].start() if i + 1 < len(codigos) else len(texto)
-        bloque = texto[codigo.end():fin]
-        hallazgo = patron.search(bloque)
-        if not hallazgo:
+        try:
+            # El campo 'fecha' de ArcGIS es una fecha en milisegundos.
+            fecha = datetime.fromtimestamp(fecha_ms / 1000, tz=timezone.utc)
+            hora = re.search(r'\d{1,2}:\d{2}:\d{2}', str(campos.get('hora', '')))
+            fecha_local = fecha.strftime('%d/%m/%Y') + ' ' + (
+                hora.group().zfill(8) if hora else fecha.strftime('%H:%M:%S'))
+            magnitud = float(campos['magnitud'])
+            rows.append({
+                'codigo': 'IGP/CENSIS/RS ' + codigo.group(),
+                'referencia': str(campos.get('ref') or 'No disponible').strip(),
+                'semaforo': 'No disponible',  # No figura en este servicio de datos.
+                'magnitud': magnitud,
+                'fecha_local': fecha_local
+            })
+        except (TypeError, ValueError, OverflowError):
             continue
-        referencia, semaforo, magnitud, fecha = hallazgo.groups()
-        registro = _armar_sismo(codigo.group(), referencia, semaforo, magnitud, fecha)
-        if registro:
-            yield registro
 
-
-def extraer_sismos(html):
-    """Extrae EXACTAMENTE los 10 reportes mas recientes del HTML disponible."""
-    soup = BeautifulSoup(html, "html.parser")
-    registros = {}
-    for registro in _leer_filas_de_tabla(soup):
-        registros[registro["codigo"]] = registro
-    for registro in _leer_fichas_de_texto(soup):
-        registros.setdefault(registro["codigo"], registro)
-    ordenados = sorted(
-        registros.values(),
-        key=lambda r: datetime.strptime(r["fecha_local"], "%d/%m/%Y %H:%M:%S"),
-        reverse=True,
-    )
-    if len(ordenados) < 10:
-        raise ValueError(
-            f"Solo se encontraron {len(ordenados)} reportes válidos en el HTML. "
-            "Verifica si el IGP cambió el HTML o carga los datos mediante JavaScript."
-        )
-    return ordenados[:10]
-
-
-def _respuesta(estado, contenido):
-    return {
-        "statusCode": estado,
-        "headers": {"Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*"},
-        "body": json.dumps(contenido, ensure_ascii=False),
-    }
+    rows = list({row['codigo']: row for row in rows}.values())
+    return sorted(rows, key=fecha_orden, reverse=True)[:10]
 
 
 def lambda_handler(event, context):
-    tabla_nombre = os.environ.get("TABLE_NAME")
-    if not tabla_nombre:
-        return _respuesta(500, {"error": "Falta la variable de entorno TABLE_NAME"})
+    # Realizar solicitud HTTP a la página del IGP.
+    try:
+        response = requests.get(URL, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+        response.raise_for_status()
+        rows = extraer_tabla_html(response.content)
+        fuente = 'pagina_igp'
+    except requests.RequestException:
+        rows = []
+        fuente = 'servicio_igp'
+
+    # Si el HTML no trae los 10 sismos, consultar servicio oficial del IGP.
+    if len(rows) < 10:
+        try:
+            rows = extraer_datos_igp()
+            fuente = 'servicio_igp'
+        except (requests.RequestException, ValueError, KeyError, TypeError) as error:
+            return respuesta(502, {'error': 'No se pudo consultar el IGP',
+                                   'detalle': str(error)})
+
+    if len(rows) < 10:
+        return respuesta(502, {'error': 'No se encontraron 10 sismos válidos',
+                               'cantidad': len(rows)})
+
+    # Guardar en la tabla DynamoDB creada mediante Serverless.
+    dynamodb = boto3.resource('dynamodb')
+    table = dynamodb.Table(TABLA_DYNAMODB)
 
     try:
-        respuesta = requests.get(
-            URL_IGP,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; TallerAcademico/1.0)"},
-            timeout=15,
-        )
-        respuesta.raise_for_status()
-        sismos = extraer_sismos(respuesta.text)
-    except (requests.RequestException, ValueError) as exc:
-        logger.exception("No se pudo extraer la información del IGP")
-        return _respuesta(502, {"error": "No se pudo extraer la información del IGP", "detalle": str(exc)})
+        # Igual que el profesor: limpiar los registros anteriores.
+        scan = table.scan(ProjectionExpression='codigo')
+        with table.batch_writer() as batch:
+            while True:
+                for each in scan.get('Items', []):
+                    batch.delete_item(Key={'codigo': each['codigo']})
+                if 'LastEvaluatedKey' not in scan:
+                    break
+                scan = table.scan(
+                    ProjectionExpression='codigo',
+                    ExclusiveStartKey=scan['LastEvaluatedKey']
+                )
 
-    try:
-        tabla = boto3.resource("dynamodb").Table(tabla_nombre)
-        fecha_consulta = datetime.now(timezone.utc).isoformat()
-        for sismo in sismos:
-            item = {**sismo, "magnitud": Decimal(str(sismo["magnitud"])), "fecha_consulta_utc": fecha_consulta}
-            # La clave codigo evita duplicados en llamadas sucesivas.
-            tabla.put_item(Item=item)
-    except Exception:
-        logger.exception("Error al guardar reportes en DynamoDB")
-        return _respuesta(500, {"error": "No se pudieron guardar los reportes en DynamoDB"})
+        # Insertar los 10 nuevos registros.
+        with table.batch_writer() as batch:
+            for row in rows:
+                item = dict(row)
+                item['magnitud'] = Decimal(str(row['magnitud']))
+                batch.put_item(Item=item)
+    except Exception as error:
+        return respuesta(500, {'error': 'No se pudieron guardar los sismos en DynamoDB',
+                               'detalle': str(error)})
 
-    return _respuesta(200, {"mensaje": "Sismos almacenados correctamente", "cantidad": len(sismos), "tabla": tabla_nombre, "sismos": sismos})
+    return respuesta(200, {
+        'mensaje': '10 sismos guardados correctamente',
+        'cantidad': len(rows),
+        'tabla': TABLA_DYNAMODB,
+        'fuente': fuente,
+        'sismos': rows
+    })
